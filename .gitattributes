@@ -1,0 +1,4 @@
+# Keep notebooks from dominating the language bar (none committed now, kept for safety)
+*.ipynb linguist-vendored
+# Main project code is Python.
+*.py linguist-language=Python

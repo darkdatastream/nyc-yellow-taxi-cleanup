@@ -1,0 +1,6 @@
+category,rows,pct_of_dataset,recommended_handling
+null_pattern,19859480,9.9915,keep + flag as structured missingness
+negative_money,4367033,2.1971,keep + flag as vendor-specific monetary pattern
+equal_time,609230,0.3065,keep + flag as structured timestamp anomaly
+reverse_time_dst_like,4497,0.0023,keep + flag as DST-like time ambiguity
+reverse_time_non_dst,53187,0.0268,keep + flag as structured non-DST time anomaly

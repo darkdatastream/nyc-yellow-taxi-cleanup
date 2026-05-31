@@ -1,0 +1,23 @@
+# Data — never commit (multi-GB)
+data/raw/
+data/processed/
+*.parquet
+
+# Big CSV anywhere by default, but keep reference + reports
+*.csv
+!data/reference/taxi_zone_lookup.csv
+!reports/*.csv
+
+# Generated images
+reports/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
