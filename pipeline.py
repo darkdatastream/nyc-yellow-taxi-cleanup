@@ -5,22 +5,27 @@ Reads raw monthly Parquet files (2021-2025), flags quality issues at the
 record level (keep + flag, never delete), writes a flagged dataset plus
 summary reports.
 
-Quality rules (unchanged from the single-year audit):
-  - negative_money    : fare_amount < 0  OR total_amount < 0
-  - null_pattern      : RatecodeID, passenger_count, store_and_fwd_flag all null
-  - equal_time        : pickup == dropoff
-  - reverse_time      : pickup >  dropoff
-      - dst_fallback  : reverse_time on that year's DST clock-fallback date,
-                        pickup hour == 1 AND dropoff hour == 1
-      - non_dst       : reverse_time that is not the DST fallback pattern
+Quality rules:
+  - negative_money          : fare_amount < 0  OR total_amount < 0
+  - null_pattern            : RatecodeID, passenger_count, store_and_fwd_flag all null
+  - invalid_vendor_id       : VendorID outside the official TLC yellow-taxi codes
+  - invalid_passenger_count : passenger_count is missing, fractional, <= 0, or > 6
+  - invalid_ratecode_id     : RatecodeID outside the official TLC yellow-taxi codes
+  - invalid_location_id     : PULocationID or DOLocationID outside taxi_zone_lookup range
+  - equal_time              : pickup == dropoff
+  - reverse_time            : pickup >  dropoff
+      - dst_fallback        : reverse_time on that year's DST clock-fallback date,
+                              pickup hour == 1 AND dropoff hour == 1
+      - non_dst             : reverse_time that is not the DST fallback pattern
 
 Why this version exists (schema reality across years):
   - Column `airport_fee` is spelled `airport_fee` (2021-2022) and `Airport_fee`
     (2023+). We normalise to `airport_fee`.
   - `cbd_congestion_fee` exists only from 2025 (congestion pricing). Older files
     get it added as null so the rest of the code is identical for every year.
-  - Numeric types drift (Int64 vs Int32, Float64 vs Int64). We normalise the
-    key columns so comparisons and writes are stable.
+  - Numeric types drift (Int64 vs Int32, Float64 vs Int64). We validate domain
+    constraints first, then narrow small coded fields to memory-light integer
+    types for flagged output.
   - DST fallback date differs every year. We use an explicit lookup table per
     year instead of a single hardcoded date - a single hardcoded date would
     mislabel DST events in every other year.
@@ -33,6 +38,18 @@ import sys
 import time
 
 import polars as pl
+
+
+# --- Official/domain constraints used as data-quality checks ---
+VALID_VENDOR_IDS = [1, 2, 6, 7]
+VALID_RATECODE_IDS = [1, 2, 3, 4, 5, 6, 99]
+
+MIN_PASSENGER_COUNT = 1
+MAX_PASSENGER_COUNT = 6
+
+# data/reference/taxi_zone_lookup.csv contains LocationID 1..265
+MIN_TAXI_ZONE_ID = 1
+MAX_TAXI_ZONE_ID = 265
 
 
 # --- DST clock-fallback dates (first Sunday of November, US) ---
@@ -48,8 +65,23 @@ DST_FALLBACK_DATES = {
 
 # Flags that count toward "is this row anomalous". reverse_time already covers
 # dst + non_dst, so sub-flags are NOT re-added (that would double count).
-ANOMALY_FLAGS = ["flag_negative_money", "flag_null_pattern",
-                 "flag_equal_time", "flag_reverse_time"]
+ANOMALY_FLAGS = [
+    "flag_negative_money",
+    "flag_null_pattern",
+    "flag_invalid_vendor_id",
+    "flag_invalid_passenger_count",
+    "flag_invalid_ratecode_id",
+    "flag_invalid_location_id",
+    "flag_equal_time",
+    "flag_reverse_time",
+]
+
+REPORT_FLAGS = ANOMALY_FLAGS + [
+    "flag_invalid_pu_location_id",
+    "flag_invalid_do_location_id",
+    "flag_dst_fallback",
+    "flag_reverse_time_non_dst",
+]
 
 
 def year_from_filename(name: str) -> int:
@@ -57,6 +89,27 @@ def year_from_filename(name: str) -> int:
     if not m:
         raise ValueError(f"Cannot read year from filename: {name}")
     return int(m.group(1))
+
+
+def code_is_in(expr: pl.Expr, valid_values: list[int]) -> pl.Expr:
+    """Return true only for non-null, whole-number codes in the allowed set."""
+    value = expr.cast(pl.Float64, strict=False)
+    return (
+        value.is_not_null()
+        & (value == value.floor())
+        & value.is_in([float(v) for v in valid_values])
+    )
+
+
+def whole_number_in_range(expr: pl.Expr, min_value: int, max_value: int) -> pl.Expr:
+    """Return true only for non-null, whole-number values inside an inclusive range."""
+    value = expr.cast(pl.Float64, strict=False)
+    return (
+        value.is_not_null()
+        & (value == value.floor())
+        & (value >= min_value)
+        & (value <= max_value)
+    )
 
 
 def normalise_schema(lf: pl.LazyFrame, schema: dict) -> pl.LazyFrame:
@@ -78,14 +131,6 @@ def normalise_schema(lf: pl.LazyFrame, schema: dict) -> pl.LazyFrame:
     if add:
         lf = lf.with_columns(add)
 
-    # 3) normalise key column types so comparisons/writes are stable across years
-    lf = lf.with_columns([
-        pl.col("VendorID").cast(pl.Int64),
-        pl.col("passenger_count").cast(pl.Float64),
-        pl.col("RatecodeID").cast(pl.Float64),
-        pl.col("PULocationID").cast(pl.Int64),
-        pl.col("DOLocationID").cast(pl.Int64),
-    ])
     return lf
 
 
@@ -106,20 +151,100 @@ def add_flags(lf: pl.LazyFrame, year: int) -> pl.LazyFrame:
             & (pl.col("tpep_dropoff_datetime").dt.hour() == 1)
         )
 
+    valid_vendor_id = code_is_in(pl.col("VendorID"), VALID_VENDOR_IDS)
+    valid_passenger_count = whole_number_in_range(
+        pl.col("passenger_count"),
+        MIN_PASSENGER_COUNT,
+        MAX_PASSENGER_COUNT,
+    )
+    valid_ratecode_id = code_is_in(pl.col("RatecodeID"), VALID_RATECODE_IDS)
+    valid_pu_location_id = whole_number_in_range(
+        pl.col("PULocationID"),
+        MIN_TAXI_ZONE_ID,
+        MAX_TAXI_ZONE_ID,
+    )
+    valid_do_location_id = whole_number_in_range(
+        pl.col("DOLocationID"),
+        MIN_TAXI_ZONE_ID,
+        MAX_TAXI_ZONE_ID,
+    )
+
     lf = lf.with_columns([
-        ((pl.col("fare_amount") < 0) | (pl.col("total_amount") < 0)).alias("flag_negative_money"),
+        ((pl.col("fare_amount") < 0) | (pl.col("total_amount") < 0))
+        .fill_null(False)
+        .alias("flag_negative_money"),
         (
             pl.col("RatecodeID").is_null()
             & pl.col("passenger_count").is_null()
             & pl.col("store_and_fwd_flag").is_null()
         ).alias("flag_null_pattern"),
-        (pl.col("tpep_pickup_datetime") == pl.col("tpep_dropoff_datetime")).alias("flag_equal_time"),
-        reverse_time.alias("flag_reverse_time"),
-        dst_fallback.alias("flag_dst_fallback"),
-        (reverse_time & ~dst_fallback).alias("flag_reverse_time_non_dst"),
+        (~valid_vendor_id).alias("flag_invalid_vendor_id"),
+        (~valid_passenger_count).alias("flag_invalid_passenger_count"),
+        (~valid_ratecode_id).alias("flag_invalid_ratecode_id"),
+        (~valid_pu_location_id).alias("flag_invalid_pu_location_id"),
+        (~valid_do_location_id).alias("flag_invalid_do_location_id"),
+        (pl.col("tpep_pickup_datetime") == pl.col("tpep_dropoff_datetime"))
+        .fill_null(False)
+        .alias("flag_equal_time"),
+        reverse_time.fill_null(False).alias("flag_reverse_time"),
+        dst_fallback.fill_null(False).alias("flag_dst_fallback"),
+        (reverse_time & ~dst_fallback).fill_null(False).alias("flag_reverse_time_non_dst"),
     ])
-    any_flag = pl.any_horizontal([pl.col(c) for c in ANOMALY_FLAGS])
+
+    lf = lf.with_columns(
+        (
+            pl.col("flag_invalid_pu_location_id")
+            | pl.col("flag_invalid_do_location_id")
+        ).alias("flag_invalid_location_id")
+    )
+
+    # any_horizontal uses Kleene null logic; fill flags first so flag_any is
+    # always deterministic true/false, never null.
+    any_flag = pl.any_horizontal([pl.col(c).fill_null(False) for c in ANOMALY_FLAGS])
     return lf.with_columns(any_flag.alias("flag_any"))
+
+
+def preserve_invalid_raw_values(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Keep raw evidence for values that may become null during narrow casts."""
+    return lf.with_columns([
+        pl.when(pl.col("flag_invalid_vendor_id"))
+        .then(pl.col("VendorID").cast(pl.Float64, strict=False))
+        .otherwise(None)
+        .alias("raw_invalid_VendorID"),
+        pl.when(pl.col("flag_invalid_passenger_count"))
+        .then(pl.col("passenger_count").cast(pl.Float64, strict=False))
+        .otherwise(None)
+        .alias("raw_invalid_passenger_count"),
+        pl.when(pl.col("flag_invalid_ratecode_id"))
+        .then(pl.col("RatecodeID").cast(pl.Float64, strict=False))
+        .otherwise(None)
+        .alias("raw_invalid_RatecodeID"),
+        pl.when(pl.col("flag_invalid_pu_location_id"))
+        .then(pl.col("PULocationID").cast(pl.Float64, strict=False))
+        .otherwise(None)
+        .alias("raw_invalid_PULocationID"),
+        pl.when(pl.col("flag_invalid_do_location_id"))
+        .then(pl.col("DOLocationID").cast(pl.Float64, strict=False))
+        .otherwise(None)
+        .alias("raw_invalid_DOLocationID"),
+    ])
+
+
+def apply_storage_types(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Narrow small coded fields after flags are already created.
+
+    strict=False prevents one bad value from crashing the audit. Bad values are
+    already flagged, and preserve_invalid_raw_values keeps raw evidence columns
+    for forensic review in the flagged output.
+    """
+    return lf.with_columns([
+        pl.col("VendorID").cast(pl.UInt8, strict=False),
+        pl.col("passenger_count").cast(pl.UInt8, strict=False),
+        pl.col("RatecodeID").cast(pl.UInt8, strict=False),
+        pl.col("PULocationID").cast(pl.UInt16, strict=False),
+        pl.col("DOLocationID").cast(pl.UInt16, strict=False),
+    ])
 
 
 def progress(i: int, n: int, name: str, t0: float) -> None:
@@ -166,13 +291,14 @@ def main() -> int:
         lf = normalise_schema(lf, schema)
         lf = add_flags(lf, year)
 
+        if args.write_flagged:
+            lf = preserve_invalid_raw_values(lf)
+            lf = apply_storage_types(lf)
+
         counts = (
             lf.select(
                 [pl.len().alias("rows")]
-                + [pl.col(c).sum().alias(c) for c in
-                   ["flag_negative_money", "flag_null_pattern", "flag_equal_time",
-                    "flag_reverse_time", "flag_dst_fallback",
-                    "flag_reverse_time_non_dst", "flag_any"]]
+                + [pl.col(c).sum().alias(c) for c in REPORT_FLAGS + ["flag_any"]]
             )
             .collect()
             .with_columns([pl.lit(f.name).alias("file"), pl.lit(year).alias("year")])
@@ -186,17 +312,12 @@ def main() -> int:
         progress(i, len(files), f.name, t0)
 
     per_file = pl.concat(per_file_rows).select(
-        ["file", "year", "rows", "flag_negative_money", "flag_null_pattern",
-         "flag_equal_time", "flag_reverse_time", "flag_dst_fallback",
-         "flag_reverse_time_non_dst", "flag_any"]
+        ["file", "year", "rows"] + REPORT_FLAGS + ["flag_any"]
     )
 
     totals = per_file.select(
         [pl.sum("rows").alias("rows")]
-        + [pl.sum(c).alias(c) for c in
-           ["flag_negative_money", "flag_null_pattern", "flag_equal_time",
-            "flag_reverse_time", "flag_dst_fallback",
-            "flag_reverse_time_non_dst", "flag_any"]]
+        + [pl.sum(c).alias(c) for c in REPORT_FLAGS + ["flag_any"]]
     )
     t = totals.row(0, named=True)
     all_rows = t["rows"]
@@ -212,15 +333,45 @@ def main() -> int:
     )
 
     category_summary = pl.DataFrame({
-        "category": ["null_pattern", "negative_money", "equal_time",
-                     "reverse_time_dst_like", "reverse_time_non_dst"],
-        "rows": [t["flag_null_pattern"], t["flag_negative_money"], t["flag_equal_time"],
-                 t["flag_dst_fallback"], t["flag_reverse_time_non_dst"]],
-        "pct_of_dataset": [pct(t["flag_null_pattern"]), pct(t["flag_negative_money"]),
-                           pct(t["flag_equal_time"]), pct(t["flag_dst_fallback"]),
-                           pct(t["flag_reverse_time_non_dst"])],
+        "category": [
+            "null_pattern",
+            "invalid_vendor_id",
+            "invalid_passenger_count",
+            "invalid_ratecode_id",
+            "invalid_location_id",
+            "negative_money",
+            "equal_time",
+            "reverse_time_dst_like",
+            "reverse_time_non_dst",
+        ],
+        "rows": [
+            t["flag_null_pattern"],
+            t["flag_invalid_vendor_id"],
+            t["flag_invalid_passenger_count"],
+            t["flag_invalid_ratecode_id"],
+            t["flag_invalid_location_id"],
+            t["flag_negative_money"],
+            t["flag_equal_time"],
+            t["flag_dst_fallback"],
+            t["flag_reverse_time_non_dst"],
+        ],
+        "pct_of_dataset": [
+            pct(t["flag_null_pattern"]),
+            pct(t["flag_invalid_vendor_id"]),
+            pct(t["flag_invalid_passenger_count"]),
+            pct(t["flag_invalid_ratecode_id"]),
+            pct(t["flag_invalid_location_id"]),
+            pct(t["flag_negative_money"]),
+            pct(t["flag_equal_time"]),
+            pct(t["flag_dst_fallback"]),
+            pct(t["flag_reverse_time_non_dst"]),
+        ],
         "recommended_handling": [
             "keep + flag as structured missingness",
+            "keep + flag as invalid provider code",
+            "keep + flag as invalid passenger count",
+            "keep + flag as invalid rate code",
+            "keep + flag as invalid taxi zone reference",
             "keep + flag as vendor-specific monetary pattern",
             "keep + flag as structured timestamp anomaly",
             "keep + flag as DST-like time ambiguity",
@@ -248,6 +399,10 @@ def main() -> int:
     print(f"Clean           : {all_rows - t['flag_any']:,}  ({pct(all_rows - t['flag_any'])}%)")
     print("-" * 56)
     print(f"null_pattern    : {t['flag_null_pattern']:,}  ({pct(t['flag_null_pattern'])}%)")
+    print(f"invalid_vendor  : {t['flag_invalid_vendor_id']:,}  ({pct(t['flag_invalid_vendor_id'])}%)")
+    print(f"invalid_passenger: {t['flag_invalid_passenger_count']:,}  ({pct(t['flag_invalid_passenger_count'])}%)")
+    print(f"invalid_ratecode: {t['flag_invalid_ratecode_id']:,}  ({pct(t['flag_invalid_ratecode_id'])}%)")
+    print(f"invalid_location: {t['flag_invalid_location_id']:,}  ({pct(t['flag_invalid_location_id'])}%)")
     print(f"negative_money  : {t['flag_negative_money']:,}  ({pct(t['flag_negative_money'])}%)")
     print(f"equal_time      : {t['flag_equal_time']:,}  ({pct(t['flag_equal_time'])}%)")
     print(f"reverse (DST)   : {t['flag_dst_fallback']:,}")
@@ -258,10 +413,6 @@ def main() -> int:
         print(f"  {r['year']}: {r['rows']:>12,} rows   flagged {r['flagged_pct']:>7}%")
     print("=" * 56)
     print(f"Reports written to {rep_dir}/")
-    if args.write_flagged:
-        print(f"Flagged dataset written to {out_dir}/")
-    else:
-        print("(run with --write-flagged to also save the full per-record dataset)")
 
     return 0
 
