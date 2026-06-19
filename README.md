@@ -1,100 +1,90 @@
 # NYC Yellow Taxi — Multi-Year Data Quality Pipeline
 
 A reproducible data quality pipeline for NYC Yellow Taxi trip records,
-**2021–2025** — 60 monthly Parquet files, **198,762,954 records**.
+intended for the 2021–2025 monthly Parquet files.
 
-The pipeline reads raw monthly files, flags quality issues **at the record
-level**, and writes both a flagged dataset and summary reports. Its guiding
-principle is **keep + flag, never delete**: a record with a quality issue may
-still be a real, revenue-bearing trip, so it is preserved and marked rather than
-dropped.
+The pipeline reads raw monthly files, flags quality issues at the record
+level, and writes summary reports. When requested, it also writes a full
+per-record flagged Parquet output. Its guiding principle is **keep + flag,
+never delete**: a record with a quality issue may still be a real trip, so it
+is preserved and marked rather than silently removed.
 
-## Why five years (and what it revealed)
+## Current scope
 
-A single year of data is misleading. Run the audit on 2025 alone and **26.6%**
-of records look anomalous — a number that, taken at face value, would suggest
-the dataset is badly broken. It isn't. Five years side by side tell a different
-story:
+This project focuses on data-quality validation, not business forecasting.
+The pipeline checks both structural anomalies and domain constraints from the
+NYC TLC Yellow Taxi data dictionary and the taxi zone reference file.
 
-| Year | Rows | Flagged |
-|------|------|---------|
-| 2021 | 30,904,308 | 5.30% |
-| 2022 | 39,656,098 | 4.14% |
-| 2023 | 38,310,226 | 4.44% |
-| 2024 | 41,169,720 | 11.44% |
-| 2025 | 48,722,602 | 26.60% |
-
-Quality was stable and improving through 2023, then the flag rate jumped sharply
-in 2024 and again in 2025. That is not random noise — it has a cause.
-
-**The dominant flag is `null_pattern`** (RatecodeID, passenger_count and
-store_and_fwd_flag all null) — ~20M of the ~22.6M flagged rows. The obvious
-hypothesis was a new data provider. The data rejects it: VendorID 7 first
-appears in 2024, but generates **zero** null_pattern rows.
-
-The real cause is a **reporting regression in the two dominant existing
-providers (VendorID 1 and 2), starting in 2024.** For VendorID 2 — which alone
-accounts for **81%** of all null_pattern rows — the rate of unpopulated fields
-rose from **2.8% (2023) → 10.3% (2024) → 25.9% (2025)**. VendorID 1 shows the
-same trend. Two independent providers degrading simultaneously points to a
-**systemic change at the source** (e.g. a TLC reporting format change from 2024),
-not a single-vendor bug.
-
-**Recommendation:** keep the records, flag the affected fields as structurally
-missing from 2024 onward, and investigate at the source — do not delete.
-
-The analysis behind this lives in [`diagnostics/`](diagnostics/).
+The raw Parquet files and the full flagged output are not committed to GitHub.
+Only code, diagnostics, reference data, and lightweight report CSVs live in the
+repository.
 
 ## Quality rules
 
 | Flag | Rule | Handling |
 |------|------|----------|
-| `negative_money` | `fare_amount < 0` OR `total_amount < 0` | keep + flag (vendor-specific monetary pattern) |
-| `null_pattern` | `RatecodeID`, `passenger_count`, `store_and_fwd_flag` all null | keep + flag (structured missingness) |
-| `equal_time` | pickup == dropoff | keep + flag (structured timestamp anomaly) |
-| `reverse_time` | pickup > dropoff | split into the two below |
-| → `dst_fallback` | reverse_time on that year's DST clock-fallback date, both hour == 1 | keep + flag (DST ambiguity, not an error) |
-| → `non_dst` | reverse_time outside the DST window | keep + flag (structured non-DST anomaly) |
+| `negative_money` | `fare_amount < 0` OR `total_amount < 0` | keep + flag |
+| `null_pattern` | `RatecodeID`, `passenger_count`, `store_and_fwd_flag` all null | keep + flag as structured missingness |
+| `invalid_vendor_id` | `VendorID` outside known TLC Yellow Taxi provider codes: `1`, `2`, `6`, `7` | keep + flag |
+| `invalid_passenger_count` | `passenger_count` is null, fractional, `<= 0`, or `> 6` | keep + flag |
+| `invalid_ratecode_id` | `RatecodeID` outside known TLC Yellow Taxi rate codes: `1`, `2`, `3`, `4`, `5`, `6`, `99` | keep + flag |
+| `invalid_location_id` | `PULocationID` or `DOLocationID` outside taxi zone IDs `1–265` | keep + flag |
+| `equal_time` | pickup timestamp equals dropoff timestamp | keep + flag |
+| `reverse_time` | pickup timestamp is later than dropoff timestamp | split into DST-like and non-DST cases |
+| `dst_fallback` | reverse-time row on that year's DST clock-fallback date, with both pickup and dropoff hour equal to `1` | keep + flag as DST-like ambiguity |
+| `non_dst` | reverse-time row outside the DST-like pattern | keep + flag |
 
-A row counts as **flagged** if any rule fires. Overlapping issues on the same
-row are counted **once** — no double counting.
+A row counts as **flagged** if any main anomaly rule fires. Overlapping issues
+on the same row are counted once in `flag_any`; category summaries can overlap
+because one record may have more than one quality issue.
 
-DST clock-fallback dates differ every year (first Sunday of November). The
-pipeline uses an explicit per-year table rather than a hardcoded date — a single
-hardcoded date would mislabel DST events in every other year.
+## Schema and storage handling
 
-## Multi-year schema handling
+The raw files are not fully consistent across years, and the pipeline handles
+these known differences:
 
-The raw files are not consistent across years, and the pipeline absorbs this:
+- `airport_fee` is spelled `airport_fee` in some files and `Airport_fee` in others; the pipeline normalises it to `airport_fee`.
+- `cbd_congestion_fee` exists only from 2025; older files receive a null column so output schemas remain aligned.
+- Small coded fields are validated first, then narrowed for flagged output: `VendorID`, `passenger_count`, and `RatecodeID` are stored as `UInt8`; `PULocationID` and `DOLocationID` are stored as `UInt16`.
+- Invalid raw coded values are preserved in evidence columns before narrowing, for example `raw_invalid_VendorID` and `raw_invalid_passenger_count`.
+- `flag_any` is forced to deterministic true/false logic; null comparisons are not allowed to create null anomaly flags.
 
-- `airport_fee` is spelled `airport_fee` (2021–2022) and `Airport_fee` (2023+) — normalised to `airport_fee`.
-- `cbd_congestion_fee` exists only from 2025 (congestion pricing) — added as null for earlier years.
-- Numeric types drift (Int64/Int32, Float64/Int64) — key columns normalised.
-- Timestamp resolution drifts (ns/µs) — handled.
+## Known limitations
+
+The pipeline does not yet validate that all expected monthly files are present.
+If one of the 2021–2025 files is missing, the current code still processes the
+files it finds. A future improvement should add an explicit completeness check
+for the expected month set.
+
+DST handling is intentionally conservative. The `dst_fallback` flag means
+"DST-like reverse-time pattern", not proof that the row is correct. Without
+additional timezone/fold metadata, the pipeline cannot prove the exact real-world
+clock sequence for every row.
+
+The committed report CSVs should be regenerated after rule changes. The source
+of truth is the current `pipeline.py` plus a fresh local run against the raw TLC
+Parquet files.
 
 ## Project layout
 
 ```
 .
-├── pipeline.py              # the pipeline (run this)
+├── pipeline.py                  # main pipeline
 ├── diagnostics/
 │   ├── inspect_schema.py        # schema differences across years
-│   └── inspect_null_pattern.py  # the vendor regression analysis
+│   └── inspect_null_pattern.py  # vendor/year null-pattern diagnostic
 ├── requirements.txt
-├── reports/                 # summary CSVs (committed — lightweight)
+├── reports/                     # lightweight summary CSVs
 └── data/
-    ├── reference/           # taxi_zone_lookup.csv
-    ├── raw/                 # raw Parquet (gitignored — download separately)
-    └── processed/           # full flagged dataset (gitignored — generated locally)
+    ├── reference/               # taxi_zone_lookup.csv
+    ├── raw/                     # raw Parquet files, gitignored
+    └── processed/               # generated flagged output, gitignored
 ```
-
-Raw data and the full flagged output (≈3.8 GB) are **not** committed — only code
-and lightweight reports live in the repo.
 
 ## Get the data
 
 The monthly files come from the official NYC TLC trip record server. On
-Debian/Ubuntu, one command downloads 2021–2025 (skipping 2020):
+Debian/Ubuntu, this downloads the 2021–2025 Yellow Taxi monthly files:
 
 ```bash
 mkdir -p data/raw/yellow_2025 && \
@@ -112,15 +102,18 @@ done
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python pipeline.py                  # reports only (fast)
-python pipeline.py --write-flagged  # + full per-record flagged dataset (local, ~3.8 GB)
+python pipeline.py                  # summary reports only
+python pipeline.py --write-flagged  # summary reports + full flagged dataset
 ```
 
-The pipeline prints a per-file progress bar and a summary, and writes
-`per_file_summary.csv`, `per_year_summary.csv`, `category_summary.csv` and
-`clean_vs_flagged.csv` to `reports/`. All numbers are computed from the data on
-every run — nothing is hardcoded.
+The pipeline prints a per-file progress bar and writes:
+
+- `reports/per_file_summary.csv`
+- `reports/per_year_summary.csv`
+- `reports/category_summary.csv`
+- `reports/clean_vs_flagged.csv`
 
 ## Data source
 
-NYC Taxi & Limousine Commission, [TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
+NYC Taxi & Limousine Commission, TLC Trip Record Data and Yellow Taxi Trip
+Records data dictionary.
